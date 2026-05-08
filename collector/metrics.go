@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -132,19 +133,26 @@ func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
 			Labels:  make([]chproto.KV[string, string], 0, len(ts.Labels)),
 			Samples: make([]processedSample, 0, len(ts.Samples)),
 		}
-		labels := make(map[string]string, len(ts.Labels))
 		for _, l := range ts.Labels {
 			if l.Name == promModel.MetricNameLabel {
 				pts.MetricName = l.Value
 			} else {
 				pts.Labels = append(pts.Labels, chproto.KV[string, string]{Key: l.Name, Value: l.Value})
 			}
-			labels[l.Name] = l.Value
 		}
 		sort.Slice(pts.Labels, func(i, j int) bool {
 			return pts.Labels[i].Key < pts.Labels[j].Key
 		})
-		pts.Hash = promModel.LabelsToSignature(labels)
+		h := fnv.New64a()
+		h.Write([]byte(pts.MetricName))
+		h.Write([]byte{0})
+		for _, kv := range pts.Labels {
+			h.Write([]byte(kv.Key))
+			h.Write([]byte{0})
+			h.Write([]byte(kv.Value))
+			h.Write([]byte{0})
+		}
+		pts.Hash = h.Sum64()
 		for _, s := range ts.Samples {
 			pts.Samples = append(pts.Samples, processedSample{Timestamp: s.Timestamp, Value: s.Value})
 		}
@@ -164,6 +172,7 @@ func (b *MetricsBatch) Close() {
 type metricsBatchShard struct {
 	projectId string
 	shardId   int
+	shardStr  string
 	limit     int
 	exec      func(query ch.Query) error
 
@@ -188,6 +197,7 @@ func newMetricsBatchShard(projectId string, shardId int, limit int, timeout time
 	b := &metricsBatchShard{
 		projectId: projectId,
 		shardId:   shardId,
+		shardStr:  fmt.Sprint(shardId),
 		limit:     limit,
 		exec:      exec,
 		input:     make(chan *processedRequest, 64),
@@ -208,18 +218,17 @@ func newMetricsBatchShard(projectId string, shardId int, limit int, timeout time
 	go func() {
 		ticker := time.NewTicker(timeout)
 		defer ticker.Stop()
-		shardStr := fmt.Sprint(shardId)
 		for {
 			select {
 			case pr := <-b.input:
-				metricsBufferQueueSize.WithLabelValues(projectId, shardStr).Set(float64(len(b.input)))
+				metricsBufferQueueSize.WithLabelValues(projectId, b.shardStr).Set(float64(len(b.input)))
 				b.addProcessed(pr)
 				processedRequestPool.Put(pr)
 				if b.Timestamp.Rows() >= b.limit {
 					b.save()
 				}
 			case <-ticker.C:
-				metricsBufferQueueSize.WithLabelValues(projectId, shardStr).Set(float64(len(b.input)))
+				metricsBufferQueueSize.WithLabelValues(projectId, b.shardStr).Set(float64(len(b.input)))
 				if d := b.dropped.Swap(0); d > 0 {
 					klog.Warningf("dropped %d metrics requests in the last %s due to shard input channel being full", d, timeout)
 				}
@@ -245,10 +254,10 @@ func newMetricsBatchShard(projectId string, shardId int, limit int, timeout time
 func (b *metricsBatchShard) add(pr *processedRequest) {
 	select {
 	case b.input <- pr:
-		metricsBufferQueueSize.WithLabelValues(b.projectId, fmt.Sprint(b.shardId)).Set(float64(len(b.input)))
+		metricsBufferQueueSize.WithLabelValues(b.projectId, b.shardStr).Set(float64(len(b.input)))
 	default:
 		b.dropped.Add(1)
-		metricsDroppedTotal.WithLabelValues(b.projectId, fmt.Sprint(b.shardId)).Inc()
+		metricsDroppedTotal.WithLabelValues(b.projectId, b.shardStr).Inc()
 		processedRequestPool.Put(pr)
 	}
 }
@@ -335,7 +344,17 @@ func addLabelsIfNeeded(r *http.Request, body []byte, extraLabels map[string]stri
 	return snappy.Encode(nil, decompressed), nil
 }
 
+var metricsSem = make(chan struct{}, 32)
+
 func (c *Collector) Metrics(w http.ResponseWriter, r *http.Request) {
+	select {
+	case metricsSem <- struct{}{}:
+		defer func() { <-metricsSem }()
+	default:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
 	project, err := c.getProject(r.Header.Get(ApiKeyHeader))
 	if err != nil {
 		klog.Errorln(err)
@@ -352,6 +371,7 @@ func (c *Collector) Metrics(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		klog.Errorln(err)
 		http.Error(w, "", http.StatusBadRequest)
+		return
 	}
 	if cfg.UseClickHouse {
 		req, err := parseMetricsRequestBody(r, body)
