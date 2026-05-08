@@ -18,6 +18,7 @@ import (
 	chproto "github.com/ClickHouse/ch-go/proto"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/prometheus/client_golang/prometheus"
 	promModel "github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 	"k8s.io/klog"
@@ -37,7 +38,27 @@ var (
 			return &processedRequest{}
 		},
 	}
+
+	metricsBufferQueueSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "coroot_collector_metrics_buffer_size",
+			Help: "Current number of requests in the metrics ingestion queue",
+		},
+		[]string{"project_id", "shard"},
+	)
+	metricsDroppedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "coroot_collector_metrics_dropped_total",
+			Help: "Total number of dropped metrics requests",
+		},
+		[]string{"project_id", "shard"},
+	)
 )
+
+func init() {
+	prometheus.MustRegister(metricsBufferQueueSize)
+	prometheus.MustRegister(metricsDroppedTotal)
+}
 
 type processedMetadata struct {
 	MetricFamilyName string
@@ -77,12 +98,12 @@ type MetricsBatch struct {
 	rr     uint32
 }
 
-func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query) error) *MetricsBatch {
+func NewMetricsBatch(projectId string, limit int, timeout time.Duration, exec func(query ch.Query) error) *MetricsBatch {
 	b := &MetricsBatch{
 		shards: make([]*metricsBatchShard, 8),
 	}
 	for i := range b.shards {
-		b.shards[i] = newMetricsBatchShard(limit, timeout, exec)
+		b.shards[i] = newMetricsBatchShard(projectId, i, limit, timeout, exec)
 	}
 	return b
 }
@@ -141,11 +162,15 @@ func (b *MetricsBatch) Close() {
 }
 
 type metricsBatchShard struct {
-	limit int
-	exec  func(query ch.Query) error
+	projectId string
+	shardId   int
+	limit     int
+	exec      func(query ch.Query) error
 
 	input chan *processedRequest
 	done  chan struct{}
+
+	dropped atomic.Uint64
 
 	Timestamp  *chproto.ColDateTime64
 	MetricHash *chproto.ColUInt64
@@ -157,6 +182,75 @@ type metricsBatchShard struct {
 	Type             *chproto.ColLowCardinality[string]
 	Help             *chproto.ColStr
 	Unit             *chproto.ColLowCardinality[string]
+}
+
+func newMetricsBatchShard(projectId string, shardId int, limit int, timeout time.Duration, exec func(query ch.Query) error) *metricsBatchShard {
+	b := &metricsBatchShard{
+		projectId: projectId,
+		shardId:   shardId,
+		limit:     limit,
+		exec:      exec,
+		input:     make(chan *processedRequest, 64),
+		done:      make(chan struct{}),
+
+		Timestamp:  new(chproto.ColDateTime64).WithPrecision(chproto.PrecisionMilli),
+		MetricHash: new(chproto.ColUInt64),
+		Value:      new(chproto.ColFloat64),
+		MetricName: new(chproto.ColStr).LowCardinality(),
+		Labels:     chproto.NewMap[string, string](new(chproto.ColStr).LowCardinality(), new(chproto.ColStr)),
+
+		MetricFamilyName: new(chproto.ColStr).LowCardinality(),
+		Type:             new(chproto.ColStr).LowCardinality(),
+		Help:             new(chproto.ColStr),
+		Unit:             new(chproto.ColStr).LowCardinality(),
+	}
+
+	go func() {
+		ticker := time.NewTicker(timeout)
+		defer ticker.Stop()
+		shardStr := fmt.Sprint(shardId)
+		for {
+			select {
+			case pr := <-b.input:
+				metricsBufferQueueSize.WithLabelValues(projectId, shardStr).Set(float64(len(b.input)))
+				b.addProcessed(pr)
+				processedRequestPool.Put(pr)
+				if b.Timestamp.Rows() >= b.limit {
+					b.save()
+				}
+			case <-ticker.C:
+				metricsBufferQueueSize.WithLabelValues(projectId, shardStr).Set(float64(len(b.input)))
+				if d := b.dropped.Swap(0); d > 0 {
+					klog.Warningf("dropped %d metrics requests in the last %s due to shard input channel being full", d, timeout)
+				}
+				b.save()
+			case <-b.done:
+				for {
+					select {
+					case pr := <-b.input:
+						b.addProcessed(pr)
+						processedRequestPool.Put(pr)
+					default:
+						b.save()
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	return b
+}
+
+func (b *metricsBatchShard) add(pr *processedRequest) {
+	select {
+	case b.input <- pr:
+		metricsBufferQueueSize.WithLabelValues(b.projectId, fmt.Sprint(b.shardId)).Set(float64(len(b.input)))
+	default:
+		b.dropped.Add(1)
+		metricsDroppedTotal.WithLabelValues(b.projectId, fmt.Sprint(b.shardId)).Inc()
+		processedRequestPool.Put(pr)
+	}
 }
 
 func newMetricsBatchShard(limit int, timeout time.Duration, exec func(query ch.Query) error) *metricsBatchShard {
@@ -190,6 +284,9 @@ func newMetricsBatchShard(limit int, timeout time.Duration, exec func(query ch.Q
 					b.save()
 				}
 			case <-ticker.C:
+				if d := b.dropped.Swap(0); d > 0 {
+					klog.Warningf("dropped %d metrics requests in the last %s due to shard input channel being full", d, timeout)
+				}
 				b.save()
 			case <-b.done:
 				for {
@@ -213,8 +310,8 @@ func (b *metricsBatchShard) add(pr *processedRequest) {
 	select {
 	case b.input <- pr:
 	default:
+		b.dropped.Add(1)
 		processedRequestPool.Put(pr)
-		klog.Warningln("dropped metrics request: shard input channel full")
 	}
 }
 

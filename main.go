@@ -25,6 +25,7 @@ import (
 	"github.com/coroot/coroot/utils"
 	"github.com/coroot/coroot/watchers"
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/term"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"k8s.io/klog"
@@ -150,6 +151,7 @@ func main() {
 	router.Use(statsCollector.MiddleWare)
 	router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
 	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {}).Methods(http.MethodGet)
+	router.Handle("/metrics", promhttp.Handler())
 
 	router.HandleFunc("/v1/metrics", coll.Metrics)
 	router.HandleFunc("/v1/traces", coll.Traces)
