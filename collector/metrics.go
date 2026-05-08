@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
@@ -29,8 +31,255 @@ var (
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 	}}
+
+	processedRequestPool = sync.Pool{
+		New: func() any {
+			return &processedRequest{}
+		},
+	}
 )
 
+type processedMetadata struct {
+	MetricFamilyName string
+	Type             string
+	Help             string
+	Unit             string
+}
+
+type processedSample struct {
+	Timestamp int64
+	Value     float64
+}
+
+type processedTimeseries struct {
+	MetricName string
+	Labels     []chproto.KV[string, string]
+	Hash       uint64
+	Samples    []processedSample
+}
+
+type processedRequest struct {
+	Metadata   []processedMetadata
+	Timeseries []processedTimeseries
+}
+
+func (pr *processedRequest) reset() {
+	pr.Metadata = pr.Metadata[:0]
+	for i := range pr.Timeseries {
+		pr.Timeseries[i].Labels = pr.Timeseries[i].Labels[:0]
+		pr.Timeseries[i].Samples = pr.Timeseries[i].Samples[:0]
+	}
+	pr.Timeseries = pr.Timeseries[:0]
+}
+
+type MetricsBatch struct {
+	shards []*metricsBatchShard
+	rr     uint32
+}
+
+func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query) error) *MetricsBatch {
+	b := &MetricsBatch{
+		shards: make([]*metricsBatchShard, 8),
+	}
+	for i := range b.shards {
+		b.shards[i] = newMetricsBatchShard(limit, timeout, exec)
+	}
+	return b
+}
+
+func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
+	pr := processedRequestPool.Get().(*processedRequest)
+	pr.reset()
+
+	if cap(pr.Metadata) < len(req.Metadata) {
+		pr.Metadata = make([]processedMetadata, 0, len(req.Metadata))
+	}
+	if cap(pr.Timeseries) < len(req.Timeseries) {
+		pr.Timeseries = make([]processedTimeseries, 0, len(req.Timeseries))
+	}
+
+	for _, md := range req.Metadata {
+		pr.Metadata = append(pr.Metadata, processedMetadata{
+			MetricFamilyName: md.GetMetricFamilyName(),
+			Type:             md.GetType().String(),
+			Help:             md.GetHelp(),
+			Unit:             md.GetUnit(),
+		})
+	}
+	for _, ts := range req.Timeseries {
+		pts := processedTimeseries{
+			Labels:  make([]chproto.KV[string, string], 0, len(ts.Labels)),
+			Samples: make([]processedSample, 0, len(ts.Samples)),
+		}
+		labels := make(map[string]string, len(ts.Labels))
+		for _, l := range ts.Labels {
+			if l.Name == promModel.MetricNameLabel {
+				pts.MetricName = l.Value
+			} else {
+				pts.Labels = append(pts.Labels, chproto.KV[string, string]{Key: l.Name, Value: l.Value})
+			}
+			labels[l.Name] = l.Value
+		}
+		sort.Slice(pts.Labels, func(i, j int) bool {
+			return pts.Labels[i].Key < pts.Labels[j].Key
+		})
+		pts.Hash = promModel.LabelsToSignature(labels)
+		for _, s := range ts.Samples {
+			pts.Samples = append(pts.Samples, processedSample{Timestamp: s.Timestamp, Value: s.Value})
+		}
+		pr.Timeseries = append(pr.Timeseries, pts)
+	}
+
+	shardIdx := atomic.AddUint32(&b.rr, 1) % uint32(len(b.shards))
+	b.shards[shardIdx].add(pr)
+}
+
+func (b *MetricsBatch) Close() {
+	for _, s := range b.shards {
+		s.close()
+	}
+}
+
+type metricsBatchShard struct {
+	limit int
+	exec  func(query ch.Query) error
+
+	input chan *processedRequest
+	done  chan struct{}
+
+	Timestamp  *chproto.ColDateTime64
+	MetricHash *chproto.ColUInt64
+	Value      *chproto.ColFloat64
+	MetricName *chproto.ColLowCardinality[string]
+	Labels     *chproto.ColMap[string, string]
+
+	MetricFamilyName *chproto.ColLowCardinality[string]
+	Type             *chproto.ColLowCardinality[string]
+	Help             *chproto.ColStr
+	Unit             *chproto.ColLowCardinality[string]
+}
+
+func newMetricsBatchShard(limit int, timeout time.Duration, exec func(query ch.Query) error) *metricsBatchShard {
+	b := &metricsBatchShard{
+		limit: limit,
+		exec:  exec,
+		input: make(chan *processedRequest, 64),
+		done:  make(chan struct{}),
+
+		Timestamp:  new(chproto.ColDateTime64).WithPrecision(chproto.PrecisionMilli),
+		MetricHash: new(chproto.ColUInt64),
+		Value:      new(chproto.ColFloat64),
+		MetricName: new(chproto.ColStr).LowCardinality(),
+		Labels:     chproto.NewMap[string, string](new(chproto.ColStr).LowCardinality(), new(chproto.ColStr)),
+
+		MetricFamilyName: new(chproto.ColStr).LowCardinality(),
+		Type:             new(chproto.ColStr).LowCardinality(),
+		Help:             new(chproto.ColStr),
+		Unit:             new(chproto.ColStr).LowCardinality(),
+	}
+
+	go func() {
+		ticker := time.NewTicker(timeout)
+		defer ticker.Stop()
+		for {
+			select {
+			case pr := <-b.input:
+				b.addProcessed(pr)
+				processedRequestPool.Put(pr)
+				if b.Timestamp.Rows() >= b.limit {
+					b.save()
+				}
+			case <-ticker.C:
+				b.save()
+			case <-b.done:
+				for {
+					select {
+					case pr := <-b.input:
+						b.addProcessed(pr)
+						processedRequestPool.Put(pr)
+					default:
+						b.save()
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	return b
+}
+
+func (b *metricsBatchShard) add(pr *processedRequest) {
+	select {
+	case b.input <- pr:
+	default:
+		processedRequestPool.Put(pr)
+		klog.Warningln("dropped metrics request: shard input channel full")
+	}
+}
+
+func (b *metricsBatchShard) close() {
+	b.done <- struct{}{}
+}
+
+func (b *metricsBatchShard) addProcessed(pr *processedRequest) {
+	for _, md := range pr.Metadata {
+		b.MetricFamilyName.Append(md.MetricFamilyName)
+		b.Type.Append(md.Type)
+		b.Help.Append(md.Help)
+		b.Unit.Append(md.Unit)
+	}
+
+	for _, ts := range pr.Timeseries {
+		for _, sample := range ts.Samples {
+			b.MetricName.Append(ts.MetricName)
+			b.Labels.AppendKV(ts.Labels)
+			b.Timestamp.Append(time.Unix(sample.Timestamp/1000, 0))
+			b.MetricHash.Append(ts.Hash)
+			b.Value.Append(sample.Value)
+		}
+	}
+}
+
+func (b *metricsBatchShard) save() {
+	if b.Timestamp.Rows() == 0 {
+		return
+	}
+
+	labelsInput := chproto.Input{
+		chproto.InputColumn{Name: "MetricName", Data: b.MetricName},
+		chproto.InputColumn{Name: "Labels", Data: b.Labels},
+		chproto.InputColumn{Name: "Timestamp", Data: b.Timestamp},
+		chproto.InputColumn{Name: "MetricHash", Data: b.MetricHash},
+		chproto.InputColumn{Name: "Value", Data: b.Value},
+	}
+	if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics@@"), Input: labelsInput}); err != nil {
+		klog.Errorln("failed to insert metrics:", err)
+	}
+
+	if b.MetricFamilyName.Rows() > 0 {
+		labelsInput = chproto.Input{
+			chproto.InputColumn{Name: "MetricFamilyName", Data: b.MetricFamilyName},
+			chproto.InputColumn{Name: "Type", Data: b.Type},
+			chproto.InputColumn{Name: "Help", Data: b.Help},
+			chproto.InputColumn{Name: "Unit", Data: b.Unit},
+		}
+		if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics_metadata@@"), Input: labelsInput}); err != nil {
+			klog.Errorln("failed to insert metrics metadata:", err)
+		}
+		b.MetricFamilyName.Reset()
+		b.Type.Reset()
+		b.Help.Reset()
+		b.Unit.Reset()
+	}
+
+	// Reset all columns
+	b.MetricName.Reset()
+	b.Labels.Reset()
+	b.Timestamp.Reset()
+	b.MetricHash.Reset()
+	b.Value.Reset()
+}
 func addLabelsIfNeeded(r *http.Request, body []byte, extraLabels map[string]string) ([]byte, error) {
 	if len(extraLabels) == 0 {
 		return body, nil
@@ -180,202 +429,4 @@ func parseMetricsRequestBody(r *http.Request, body []byte) (*prompb.WriteRequest
 	}
 
 	return &req, nil
-}
-
-type processedMetadata struct {
-	MetricFamilyName string
-	Type             string
-	Help             string
-	Unit             string
-}
-
-type processedSample struct {
-	Timestamp int64
-	Value     float64
-}
-
-type processedTimeseries struct {
-	MetricName string
-	Labels     []chproto.KV[string, string]
-	Hash       uint64
-	Samples    []processedSample
-}
-
-type processedRequest struct {
-	Metadata   []processedMetadata
-	Timeseries []processedTimeseries
-}
-
-type MetricsBatch struct {
-	limit int
-	exec  func(query ch.Query) error
-
-	input chan *processedRequest
-	done  chan struct{}
-
-	Timestamp  *chproto.ColDateTime64
-	MetricHash *chproto.ColUInt64
-	Value      *chproto.ColFloat64
-	MetricName *chproto.ColLowCardinality[string]
-	Labels     *chproto.ColMap[string, string]
-
-	MetricFamilyName *chproto.ColLowCardinality[string]
-	Type             *chproto.ColLowCardinality[string]
-	Help             *chproto.ColStr
-	Unit             *chproto.ColLowCardinality[string]
-}
-
-func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query) error) *MetricsBatch {
-	b := &MetricsBatch{
-		limit: limit,
-		exec:  exec,
-		input: make(chan *processedRequest, 256),
-		done:  make(chan struct{}),
-
-		Timestamp:  new(chproto.ColDateTime64).WithPrecision(chproto.PrecisionMilli),
-		MetricHash: new(chproto.ColUInt64),
-		Value:      new(chproto.ColFloat64),
-		MetricName: new(chproto.ColStr).LowCardinality(),
-		Labels:     chproto.NewMap[string, string](new(chproto.ColStr).LowCardinality(), new(chproto.ColStr)),
-
-		MetricFamilyName: new(chproto.ColStr).LowCardinality(),
-		Type:             new(chproto.ColStr).LowCardinality(),
-		Help:             new(chproto.ColStr),
-		Unit:             new(chproto.ColStr).LowCardinality(),
-	}
-
-	go func() {
-		ticker := time.NewTicker(timeout)
-		defer ticker.Stop()
-		for {
-			select {
-			case pr := <-b.input:
-				b.addProcessed(pr)
-				if b.Timestamp.Rows() >= b.limit {
-					b.save()
-				}
-			case <-ticker.C:
-				b.save()
-			case <-b.done:
-				for {
-					select {
-					case pr := <-b.input:
-						b.addProcessed(pr)
-					default:
-						b.save()
-						return
-					}
-				}
-			}
-		}
-	}()
-
-	return b
-}
-
-func (b *MetricsBatch) Close() {
-	b.done <- struct{}{}
-}
-
-func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
-	pr := &processedRequest{
-		Metadata:   make([]processedMetadata, 0, len(req.Metadata)),
-		Timeseries: make([]processedTimeseries, 0, len(req.Timeseries)),
-	}
-	for _, md := range req.Metadata {
-		pr.Metadata = append(pr.Metadata, processedMetadata{
-			MetricFamilyName: md.GetMetricFamilyName(),
-			Type:             md.GetType().String(),
-			Help:             md.GetHelp(),
-			Unit:             md.GetUnit(),
-		})
-	}
-	for _, ts := range req.Timeseries {
-		pts := processedTimeseries{
-			Labels:  make([]chproto.KV[string, string], 0, len(ts.Labels)),
-			Samples: make([]processedSample, 0, len(ts.Samples)),
-		}
-		labels := make(map[string]string, len(ts.Labels))
-		for _, l := range ts.Labels {
-			if l.Name == promModel.MetricNameLabel {
-				pts.MetricName = l.Value
-			} else {
-				pts.Labels = append(pts.Labels, chproto.KV[string, string]{Key: l.Name, Value: l.Value})
-			}
-			labels[l.Name] = l.Value
-		}
-		sort.Slice(pts.Labels, func(i, j int) bool {
-			return pts.Labels[i].Key < pts.Labels[j].Key
-		})
-		pts.Hash = promModel.LabelsToSignature(labels)
-		for _, s := range ts.Samples {
-			pts.Samples = append(pts.Samples, processedSample{Timestamp: s.Timestamp, Value: s.Value})
-		}
-		pr.Timeseries = append(pr.Timeseries, pts)
-	}
-
-	select {
-	case b.input <- pr:
-	default:
-		klog.Warningln("dropped metrics request: input channel full")
-	}
-}
-
-func (b *MetricsBatch) addProcessed(pr *processedRequest) {
-	for _, md := range pr.Metadata {
-		b.MetricFamilyName.Append(md.MetricFamilyName)
-		b.Type.Append(md.Type)
-		b.Help.Append(md.Help)
-		b.Unit.Append(md.Unit)
-	}
-
-	for _, ts := range pr.Timeseries {
-		for _, sample := range ts.Samples {
-			b.MetricName.Append(ts.MetricName)
-			b.Labels.AppendKV(ts.Labels)
-			b.Timestamp.Append(time.Unix(sample.Timestamp/1000, 0))
-			b.MetricHash.Append(ts.Hash)
-			b.Value.Append(sample.Value)
-		}
-	}
-}
-
-func (b *MetricsBatch) save() {
-	if b.Timestamp.Rows() == 0 {
-		return
-	}
-
-	labelsInput := chproto.Input{
-		chproto.InputColumn{Name: "MetricName", Data: b.MetricName},
-		chproto.InputColumn{Name: "Labels", Data: b.Labels},
-		chproto.InputColumn{Name: "Timestamp", Data: b.Timestamp},
-		chproto.InputColumn{Name: "MetricHash", Data: b.MetricHash},
-		chproto.InputColumn{Name: "Value", Data: b.Value},
-	}
-	if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics@@"), Input: labelsInput}); err != nil {
-		klog.Errorln("failed to insert metrics:", err)
-	}
-
-	if b.MetricFamilyName.Rows() > 0 {
-		labelsInput = chproto.Input{
-			chproto.InputColumn{Name: "MetricFamilyName", Data: b.MetricFamilyName},
-			chproto.InputColumn{Name: "Type", Data: b.Type},
-			chproto.InputColumn{Name: "Help", Data: b.Help},
-			chproto.InputColumn{Name: "Unit", Data: b.Unit},
-		}
-		if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics_metadata@@"), Input: labelsInput}); err != nil {
-			klog.Errorln("failed to insert metrics metadata:", err)
-		}
-		b.MetricFamilyName.Reset()
-		b.Type.Reset()
-		b.Help.Reset()
-		b.Unit.Reset()
-	}
-
-	// Reset all columns
-	b.MetricName.Reset()
-	b.Labels.Reset()
-	b.Timestamp.Reset()
-	b.MetricHash.Reset()
-	b.Value.Reset()
 }
