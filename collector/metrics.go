@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -183,6 +184,18 @@ func parseMetricsRequestBody(r *http.Request, body []byte) (*prompb.WriteRequest
 	return &req, nil
 }
 
+type columnBatch struct {
+	Timestamp        *chproto.ColDateTime64
+	MetricHash       *chproto.ColUInt64
+	Value            *chproto.ColFloat64
+	MetricName       *chproto.ColLowCardinality[string]
+	Labels           *chproto.ColMap[string, string]
+	MetricFamilyName *chproto.ColLowCardinality[string]
+	Type             *chproto.ColLowCardinality[string]
+	Help             *chproto.ColStr
+	Unit             *chproto.ColLowCardinality[string]
+}
+
 type MetricsBatch struct {
 	limit int
 	exec  func(query ch.Query) error
@@ -226,11 +239,24 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 		for {
 			select {
 			case <-b.done:
+				b.lock.Lock()
+				if b.Timestamp.Rows() > 0 {
+					batch := b.snapshot()
+					b.lock.Unlock()
+					b.saveBatch(batch)
+				} else {
+					b.lock.Unlock()
+				}
 				return
 			case <-ticker.C:
 				b.lock.Lock()
-				b.save()
+				if b.Timestamp.Rows() == 0 {
+					b.lock.Unlock()
+					continue
+				}
+				batch := b.snapshot()
 				b.lock.Unlock()
+				b.saveBatch(batch)
 			}
 		}
 	}()
@@ -238,93 +264,138 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 	return b
 }
 
+func (b *MetricsBatch) snapshot() *columnBatch {
+	batch := &columnBatch{
+		Timestamp:        b.Timestamp,
+		MetricHash:       b.MetricHash,
+		Value:            b.Value,
+		MetricName:       b.MetricName,
+		Labels:           b.Labels,
+		MetricFamilyName: b.MetricFamilyName,
+		Type:             b.Type,
+		Help:             b.Help,
+		Unit:             b.Unit,
+	}
+	b.Timestamp = new(chproto.ColDateTime64).WithPrecision(chproto.PrecisionMilli)
+	b.MetricHash = new(chproto.ColUInt64)
+	b.Value = new(chproto.ColFloat64)
+	b.MetricName = new(chproto.ColStr).LowCardinality()
+	b.Labels = chproto.NewMap[string, string](new(chproto.ColStr).LowCardinality(), new(chproto.ColStr))
+	b.MetricFamilyName = new(chproto.ColStr).LowCardinality()
+	b.Type = new(chproto.ColStr).LowCardinality()
+	b.Help = new(chproto.ColStr)
+	b.Unit = new(chproto.ColStr).LowCardinality()
+	return batch
+}
+
 func (b *MetricsBatch) Close() {
-	b.done <- struct{}{}
-	b.lock.Lock()
-	defer b.lock.Unlock()
-	b.save()
+	close(b.done)
 }
 
 func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
-	b.lock.Lock()
-	defer b.lock.Unlock()
+	type preprocessedSample struct {
+		timestamp int64
+		value     float64
+	}
+	type preprocessedTimeseries struct {
+		metricName string
+		labels     []chproto.KV[string, string]
+		hash       uint64
+		samples    []preprocessedSample
+	}
 
+	metadataFamilyNames := make([]string, 0, len(req.Metadata))
+	metadataTypes := make([]string, 0, len(req.Metadata))
+	metadataHelps := make([]string, 0, len(req.Metadata))
+	metadataUnits := make([]string, 0, len(req.Metadata))
 	for _, md := range req.GetMetadata() {
-		b.MetricFamilyName.Append(md.GetMetricFamilyName())
-		b.Type.Append(md.GetType().String())
-		b.Help.Append(md.GetHelp())
-		b.Unit.Append(md.GetUnit())
+		metadataFamilyNames = append(metadataFamilyNames, md.GetMetricFamilyName())
+		metadataTypes = append(metadataTypes, md.GetType().String())
+		metadataHelps = append(metadataHelps, md.GetHelp())
+		metadataUnits = append(metadataUnits, md.GetUnit())
 	}
 
+	preprocessedList := make([]preprocessedTimeseries, 0, len(req.Timeseries))
 	for _, ts := range req.GetTimeseries() {
-		labels := make(map[string]string, len(ts.Labels))
-		sortable := make([]chproto.KV[string, string], 0, len(ts.Labels))
-		var metricName string
-		for _, label := range ts.Labels {
-			if label.Name == promModel.MetricNameLabel {
-				metricName = label.Value
+		pp := preprocessedTimeseries{
+			labels:  make([]chproto.KV[string, string], 0, len(ts.Labels)),
+			samples: make([]preprocessedSample, 0, len(ts.Samples)),
+		}
+		for _, l := range ts.Labels {
+			if l.Name == promModel.MetricNameLabel {
+				pp.metricName = l.Value
 			} else {
-				sortable = append(sortable, chproto.KV[string, string]{Key: label.Name, Value: label.Value})
+				pp.labels = append(pp.labels, chproto.KV[string, string]{Key: l.Name, Value: l.Value})
 			}
-			labels[label.Name] = label.Value
 		}
-		sort.Slice(sortable, func(i, j int) bool {
-			return sortable[i].Key < sortable[j].Key
+		sort.Slice(pp.labels, func(i, j int) bool {
+			return pp.labels[i].Key < pp.labels[j].Key
 		})
-		hash := promModel.LabelsToSignature(labels)
-		for _, sample := range ts.Samples {
-			b.MetricName.Append(metricName)
-			b.Labels.AppendKV(sortable)
-			b.Timestamp.Append(time.Unix(sample.Timestamp/1000, 0))
-			b.MetricHash.Append(hash)
-			b.Value.Append(sample.Value)
-
+		h := fnv.New64a()
+		h.Write([]byte(pp.metricName))
+		h.Write([]byte{0})
+		for _, kv := range pp.labels {
+			h.Write([]byte(kv.Key))
+			h.Write([]byte{0})
+			h.Write([]byte(kv.Value))
+			h.Write([]byte{0})
 		}
-		delete(labels, promModel.MetricNameLabel)
+		pp.hash = h.Sum64()
+		for _, s := range ts.Samples {
+			pp.samples = append(pp.samples, preprocessedSample{timestamp: s.Timestamp, value: s.Value})
+		}
+		preprocessedList = append(preprocessedList, pp)
 	}
 
-	if b.Timestamp.Rows() < b.limit {
-		return
+	b.lock.Lock()
+
+	for i := range metadataFamilyNames {
+		b.MetricFamilyName.Append(metadataFamilyNames[i])
+		b.Type.Append(metadataTypes[i])
+		b.Help.Append(metadataHelps[i])
+		b.Unit.Append(metadataUnits[i])
 	}
-	b.save()
+
+	for _, pp := range preprocessedList {
+		for _, s := range pp.samples {
+			b.MetricName.Append(pp.metricName)
+			b.Labels.AppendKV(pp.labels)
+			b.Timestamp.Append(time.Unix(s.timestamp/1000, 0))
+			b.MetricHash.Append(pp.hash)
+			b.Value.Append(s.value)
+		}
+	}
+
+	b.lock.Unlock()
 }
 
-func (b *MetricsBatch) save() {
-	if b.Timestamp.Rows() == 0 {
+func (b *MetricsBatch) saveBatch(batch *columnBatch) {
+	if batch.Timestamp.Rows() == 0 {
 		return
 	}
 
-	labelsInput := chproto.Input{
-		chproto.InputColumn{Name: "MetricName", Data: b.MetricName},
-		chproto.InputColumn{Name: "Labels", Data: b.Labels},
-		chproto.InputColumn{Name: "Timestamp", Data: b.Timestamp},
-		chproto.InputColumn{Name: "MetricHash", Data: b.MetricHash},
-		chproto.InputColumn{Name: "Value", Data: b.Value},
+	input := chproto.Input{
+		chproto.InputColumn{Name: "MetricName", Data: batch.MetricName},
+		chproto.InputColumn{Name: "Labels", Data: batch.Labels},
+		chproto.InputColumn{Name: "Timestamp", Data: batch.Timestamp},
+		chproto.InputColumn{Name: "MetricHash", Data: batch.MetricHash},
+		chproto.InputColumn{Name: "Value", Data: batch.Value},
 	}
-	if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics@@"), Input: labelsInput}); err != nil {
+	if err := b.exec(ch.Query{Body: input.Into("@@table_metrics@@"), Input: input}); err != nil {
 		klog.Errorln("failed to insert metrics:", err)
+		return
 	}
 
-	if b.MetricFamilyName.Rows() > 0 {
-		labelsInput = chproto.Input{
-			chproto.InputColumn{Name: "MetricFamilyName", Data: b.MetricFamilyName},
-			chproto.InputColumn{Name: "Type", Data: b.Type},
-			chproto.InputColumn{Name: "Help", Data: b.Help},
-			chproto.InputColumn{Name: "Unit", Data: b.Unit},
-		}
-		if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics_metadata@@"), Input: labelsInput}); err != nil {
-			klog.Errorln("failed to insert metrics metadata:", err)
-		}
-		b.MetricFamilyName.Reset()
-		b.Type.Reset()
-		b.Help.Reset()
-		b.Unit.Reset()
+	if batch.MetricFamilyName.Rows() == 0 {
+		return
 	}
-
-	// Reset all columns
-	b.MetricName.Reset()
-	b.Labels.Reset()
-	b.Timestamp.Reset()
-	b.MetricHash.Reset()
-	b.Value.Reset()
+	input = chproto.Input{
+		chproto.InputColumn{Name: "MetricFamilyName", Data: batch.MetricFamilyName},
+		chproto.InputColumn{Name: "Type", Data: batch.Type},
+		chproto.InputColumn{Name: "Help", Data: batch.Help},
+		chproto.InputColumn{Name: "Unit", Data: batch.Unit},
+	}
+	if err := b.exec(ch.Query{Body: input.Into("@@table_metrics_metadata@@"), Input: input}); err != nil {
+		klog.Errorln("failed to insert metrics metadata:", err)
+	}
 }
