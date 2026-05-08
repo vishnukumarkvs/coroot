@@ -347,6 +347,7 @@ func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
 		preprocessedList = append(preprocessedList, pp)
 	}
 
+	var batch *columnBatch
 	b.lock.Lock()
 
 	for i := range metadataFamilyNames {
@@ -366,7 +367,14 @@ func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
 		}
 	}
 
+	if b.Timestamp.Rows() >= b.limit {
+		batch = b.snapshot()
+	}
 	b.lock.Unlock()
+
+	if batch != nil {
+		b.saveBatch(batch)
+	}
 }
 
 func (b *MetricsBatch) saveBatch(batch *columnBatch) {
