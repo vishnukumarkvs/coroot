@@ -282,7 +282,9 @@ func (c *Collector) getMetricsBatch(project *db.Project) *MetricsBatch {
 	b := c.metricsBatches[project.Id]
 	if b == nil {
 		b = NewMetricsBatch(string(project.Id), batchLimit, batchTimeout, func(query chgo.Query) error {
-			return c.clickhouseDo(context.TODO(), project, query)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return c.clickhouseDo(ctx, project, query)
 		})
 		c.metricsBatches[project.Id] = b
 	}
