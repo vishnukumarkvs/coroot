@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/ClickHouse/ch-go"
@@ -187,8 +186,8 @@ type MetricsBatch struct {
 	limit int
 	exec  func(query ch.Query) error
 
-	lock sync.Mutex
-	done chan struct{}
+	input chan *prompb.WriteRequest
+	done  chan struct{}
 
 	Timestamp  *chproto.ColDateTime64
 	MetricHash *chproto.ColUInt64
@@ -206,6 +205,7 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 	b := &MetricsBatch{
 		limit: limit,
 		exec:  exec,
+		input: make(chan *prompb.WriteRequest, 512),
 		done:  make(chan struct{}),
 
 		Timestamp:  new(chproto.ColDateTime64).WithPrecision(chproto.PrecisionMilli),
@@ -225,12 +225,23 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-b.done:
-				return
+			case req := <-b.input:
+				b.handle(req)
+				if b.Timestamp.Rows() >= b.limit {
+					b.save()
+				}
 			case <-ticker.C:
-				b.lock.Lock()
 				b.save()
-				b.lock.Unlock()
+			case <-b.done:
+				for {
+					select {
+					case req := <-b.input:
+						b.handle(req)
+					default:
+						b.save()
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -240,15 +251,17 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 
 func (b *MetricsBatch) Close() {
 	b.done <- struct{}{}
-	b.lock.Lock()
-	defer b.lock.Unlock()
-	b.save()
 }
 
 func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
-	b.lock.Lock()
-	defer b.lock.Unlock()
+	select {
+	case b.input <- req:
+	default:
+		klog.Warningln("dropped metrics request: input channel full")
+	}
+}
 
+func (b *MetricsBatch) handle(req *prompb.WriteRequest) {
 	for _, md := range req.GetMetadata() {
 		b.MetricFamilyName.Append(md.GetMetricFamilyName())
 		b.Type.Append(md.GetType().String())
@@ -278,15 +291,8 @@ func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
 			b.Timestamp.Append(time.Unix(sample.Timestamp/1000, 0))
 			b.MetricHash.Append(hash)
 			b.Value.Append(sample.Value)
-
 		}
-		delete(labels, promModel.MetricNameLabel)
 	}
-
-	if b.Timestamp.Rows() < b.limit {
-		return
-	}
-	b.save()
 }
 
 func (b *MetricsBatch) save() {
