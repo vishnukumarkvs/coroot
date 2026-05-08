@@ -182,11 +182,35 @@ func parseMetricsRequestBody(r *http.Request, body []byte) (*prompb.WriteRequest
 	return &req, nil
 }
 
+type processedMetadata struct {
+	MetricFamilyName string
+	Type             string
+	Help             string
+	Unit             string
+}
+
+type processedSample struct {
+	Timestamp int64
+	Value     float64
+}
+
+type processedTimeseries struct {
+	MetricName string
+	Labels     []chproto.KV[string, string]
+	Hash       uint64
+	Samples    []processedSample
+}
+
+type processedRequest struct {
+	Metadata   []processedMetadata
+	Timeseries []processedTimeseries
+}
+
 type MetricsBatch struct {
 	limit int
 	exec  func(query ch.Query) error
 
-	input chan *prompb.WriteRequest
+	input chan *processedRequest
 	done  chan struct{}
 
 	Timestamp  *chproto.ColDateTime64
@@ -205,7 +229,7 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 	b := &MetricsBatch{
 		limit: limit,
 		exec:  exec,
-		input: make(chan *prompb.WriteRequest, 512),
+		input: make(chan *processedRequest, 256),
 		done:  make(chan struct{}),
 
 		Timestamp:  new(chproto.ColDateTime64).WithPrecision(chproto.PrecisionMilli),
@@ -225,8 +249,8 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 		defer ticker.Stop()
 		for {
 			select {
-			case req := <-b.input:
-				b.handle(req)
+			case pr := <-b.input:
+				b.addProcessed(pr)
 				if b.Timestamp.Rows() >= b.limit {
 					b.save()
 				}
@@ -235,8 +259,8 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 			case <-b.done:
 				for {
 					select {
-					case req := <-b.input:
-						b.handle(req)
+					case pr := <-b.input:
+						b.addProcessed(pr)
 					default:
 						b.save()
 						return
@@ -254,42 +278,63 @@ func (b *MetricsBatch) Close() {
 }
 
 func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
+	pr := &processedRequest{
+		Metadata:   make([]processedMetadata, 0, len(req.Metadata)),
+		Timeseries: make([]processedTimeseries, 0, len(req.Timeseries)),
+	}
+	for _, md := range req.Metadata {
+		pr.Metadata = append(pr.Metadata, processedMetadata{
+			MetricFamilyName: md.GetMetricFamilyName(),
+			Type:             md.GetType().String(),
+			Help:             md.GetHelp(),
+			Unit:             md.GetUnit(),
+		})
+	}
+	for _, ts := range req.Timeseries {
+		pts := processedTimeseries{
+			Labels:  make([]chproto.KV[string, string], 0, len(ts.Labels)),
+			Samples: make([]processedSample, 0, len(ts.Samples)),
+		}
+		labels := make(map[string]string, len(ts.Labels))
+		for _, l := range ts.Labels {
+			if l.Name == promModel.MetricNameLabel {
+				pts.MetricName = l.Value
+			} else {
+				pts.Labels = append(pts.Labels, chproto.KV[string, string]{Key: l.Name, Value: l.Value})
+			}
+			labels[l.Name] = l.Value
+		}
+		sort.Slice(pts.Labels, func(i, j int) bool {
+			return pts.Labels[i].Key < pts.Labels[j].Key
+		})
+		pts.Hash = promModel.LabelsToSignature(labels)
+		for _, s := range ts.Samples {
+			pts.Samples = append(pts.Samples, processedSample{Timestamp: s.Timestamp, Value: s.Value})
+		}
+		pr.Timeseries = append(pr.Timeseries, pts)
+	}
+
 	select {
-	case b.input <- req:
+	case b.input <- pr:
 	default:
 		klog.Warningln("dropped metrics request: input channel full")
 	}
 }
 
-func (b *MetricsBatch) handle(req *prompb.WriteRequest) {
-	for _, md := range req.GetMetadata() {
-		b.MetricFamilyName.Append(md.GetMetricFamilyName())
-		b.Type.Append(md.GetType().String())
-		b.Help.Append(md.GetHelp())
-		b.Unit.Append(md.GetUnit())
+func (b *MetricsBatch) addProcessed(pr *processedRequest) {
+	for _, md := range pr.Metadata {
+		b.MetricFamilyName.Append(md.MetricFamilyName)
+		b.Type.Append(md.Type)
+		b.Help.Append(md.Help)
+		b.Unit.Append(md.Unit)
 	}
 
-	for _, ts := range req.GetTimeseries() {
-		labels := make(map[string]string, len(ts.Labels))
-		sortable := make([]chproto.KV[string, string], 0, len(ts.Labels))
-		var metricName string
-		for _, label := range ts.Labels {
-			if label.Name == promModel.MetricNameLabel {
-				metricName = label.Value
-			} else {
-				sortable = append(sortable, chproto.KV[string, string]{Key: label.Name, Value: label.Value})
-			}
-			labels[label.Name] = label.Value
-		}
-		sort.Slice(sortable, func(i, j int) bool {
-			return sortable[i].Key < sortable[j].Key
-		})
-		hash := promModel.LabelsToSignature(labels)
+	for _, ts := range pr.Timeseries {
 		for _, sample := range ts.Samples {
-			b.MetricName.Append(metricName)
-			b.Labels.AppendKV(sortable)
+			b.MetricName.Append(ts.MetricName)
+			b.Labels.AppendKV(ts.Labels)
 			b.Timestamp.Append(time.Unix(sample.Timestamp/1000, 0))
-			b.MetricHash.Append(hash)
+			b.MetricHash.Append(ts.Hash)
 			b.Value.Append(sample.Value)
 		}
 	}
