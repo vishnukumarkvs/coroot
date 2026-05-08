@@ -299,30 +299,31 @@ func (b *metricsBatchShard) save() {
 	}
 	if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics@@"), Input: labelsInput}); err != nil {
 		klog.Errorln("failed to insert metrics:", err)
+		return
 	}
 
-	if b.MetricFamilyName.Rows() > 0 {
-		labelsInput = chproto.Input{
-			chproto.InputColumn{Name: "MetricFamilyName", Data: b.MetricFamilyName},
-			chproto.InputColumn{Name: "Type", Data: b.Type},
-			chproto.InputColumn{Name: "Help", Data: b.Help},
-			chproto.InputColumn{Name: "Unit", Data: b.Unit},
-		}
-		if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics_metadata@@"), Input: labelsInput}); err != nil {
-			klog.Errorln("failed to insert metrics metadata:", err)
-		}
-		b.MetricFamilyName.Reset()
-		b.Type.Reset()
-		b.Help.Reset()
-		b.Unit.Reset()
-	}
-
-	// Reset all columns
 	b.MetricName.Reset()
 	b.Labels.Reset()
 	b.Timestamp.Reset()
 	b.MetricHash.Reset()
 	b.Value.Reset()
+
+	if b.MetricFamilyName.Rows() == 0 {
+		return
+	}
+	labelsInput = chproto.Input{
+		chproto.InputColumn{Name: "MetricFamilyName", Data: b.MetricFamilyName},
+		chproto.InputColumn{Name: "Type", Data: b.Type},
+		chproto.InputColumn{Name: "Help", Data: b.Help},
+		chproto.InputColumn{Name: "Unit", Data: b.Unit},
+	}
+	if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics_metadata@@"), Input: labelsInput}); err != nil {
+		klog.Errorln("failed to insert metrics metadata:", err)
+	}
+	b.MetricFamilyName.Reset()
+	b.Type.Reset()
+	b.Help.Reset()
+	b.Unit.Reset()
 }
 func addLabelsIfNeeded(r *http.Request, body []byte, extraLabels map[string]string) ([]byte, error) {
 	if len(extraLabels) == 0 {
