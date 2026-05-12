@@ -31,6 +31,12 @@ var (
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 	}}
 )
+var snappyPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 512*1024) // Pre-allocate 512KB
+		return &b
+	},
+}
 
 func addLabelsIfNeeded(r *http.Request, body []byte, extraLabels map[string]string) ([]byte, error) {
 	if len(extraLabels) == 0 {
@@ -170,7 +176,22 @@ func parseMetricsRequestBody(r *http.Request, body []byte) (*prompb.WriteRequest
 		return nil, fmt.Errorf("expected snappy content-encoding")
 	}
 
-	decompressed, err := snappy.Decode(nil, body)
+	// Calculate length and borrow a buffer from the pool
+	decLen, err := snappy.DecodedLen(body)
+	if err != nil {
+		return nil, err
+	}
+
+	bufPtr := snappyPool.Get().(*[]byte)
+	defer snappyPool.Put(bufPtr)
+
+	// Grow buffer if the payload is unusually large
+	if cap(*bufPtr) < decLen {
+		*bufPtr = make([]byte, 0, decLen)
+	}
+
+	// Decode into the pooled buffer to save GC allocations
+	decompressed, err := snappy.Decode((*bufPtr)[:cap(*bufPtr)], body)
 	if err != nil {
 		return nil, err
 	}
@@ -189,6 +210,7 @@ type MetricsBatch struct {
 
 	lock sync.Mutex
 	done chan struct{}
+	wg   sync.WaitGroup
 
 	Timestamp  *chproto.ColDateTime64
 	MetricHash *chproto.ColUInt64
@@ -240,9 +262,12 @@ func NewMetricsBatch(limit int, timeout time.Duration, exec func(query ch.Query)
 
 func (b *MetricsBatch) Close() {
 	b.done <- struct{}{}
+
 	b.lock.Lock()
-	defer b.lock.Unlock()
 	b.save()
+	b.lock.Unlock()
+
+	b.wg.Wait()
 }
 
 func (b *MetricsBatch) Add(req *prompb.WriteRequest) {
@@ -294,37 +319,48 @@ func (b *MetricsBatch) save() {
 		return
 	}
 
-	labelsInput := chproto.Input{
-		chproto.InputColumn{Name: "MetricName", Data: b.MetricName},
-		chproto.InputColumn{Name: "Labels", Data: b.Labels},
-		chproto.InputColumn{Name: "Timestamp", Data: b.Timestamp},
-		chproto.InputColumn{Name: "MetricHash", Data: b.MetricHash},
-		chproto.InputColumn{Name: "Value", Data: b.Value},
-	}
-	if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics@@"), Input: labelsInput}); err != nil {
-		klog.Errorln("failed to insert metrics:", err)
-	}
+	// 1. Capture the current populated pointers
+	mName, mLabels, mTime, mHash, mVal := b.MetricName, b.Labels, b.Timestamp, b.MetricHash, b.Value
+	mfName, mType, mHelp, mUnit := b.MetricFamilyName, b.Type, b.Help, b.Unit
 
-	if b.MetricFamilyName.Rows() > 0 {
-		labelsInput = chproto.Input{
-			chproto.InputColumn{Name: "MetricFamilyName", Data: b.MetricFamilyName},
-			chproto.InputColumn{Name: "Type", Data: b.Type},
-			chproto.InputColumn{Name: "Help", Data: b.Help},
-			chproto.InputColumn{Name: "Unit", Data: b.Unit},
-		}
-		if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics_metadata@@"), Input: labelsInput}); err != nil {
-			klog.Errorln("failed to insert metrics metadata:", err)
-		}
-		b.MetricFamilyName.Reset()
-		b.Type.Reset()
-		b.Help.Reset()
-		b.Unit.Reset()
-	}
+	// 2. Instantly assign fresh pointers to the struct so Add() can keep working
+	b.Timestamp = new(chproto.ColDateTime64).WithPrecision(chproto.PrecisionMilli)
+	b.MetricHash = new(chproto.ColUInt64)
+	b.Value = new(chproto.ColFloat64)
+	b.MetricName = new(chproto.ColStr).LowCardinality()
+	b.Labels = chproto.NewMap[string, string](new(chproto.ColStr).LowCardinality(), new(chproto.ColStr))
 
-	// Reset all columns
-	b.MetricName.Reset()
-	b.Labels.Reset()
-	b.Timestamp.Reset()
-	b.MetricHash.Reset()
-	b.Value.Reset()
+	b.MetricFamilyName = new(chproto.ColStr).LowCardinality()
+	b.Type = new(chproto.ColStr).LowCardinality()
+	b.Help = new(chproto.ColStr)
+	b.Unit = new(chproto.ColStr).LowCardinality()
+
+	// 3. Execute the network I/O in the background (Waitgroup added for safe shutdowns)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+
+		labelsInput := chproto.Input{
+			chproto.InputColumn{Name: "MetricName", Data: mName},
+			chproto.InputColumn{Name: "Labels", Data: mLabels},
+			chproto.InputColumn{Name: "Timestamp", Data: mTime},
+			chproto.InputColumn{Name: "MetricHash", Data: mHash},
+			chproto.InputColumn{Name: "Value", Data: mVal},
+		}
+		if err := b.exec(ch.Query{Body: labelsInput.Into("@@table_metrics@@"), Input: labelsInput}); err != nil {
+			klog.Errorln("failed to insert metrics:", err)
+		}
+
+		if mfName.Rows() > 0 {
+			metaInput := chproto.Input{
+				chproto.InputColumn{Name: "MetricFamilyName", Data: mfName},
+				chproto.InputColumn{Name: "Type", Data: mType},
+				chproto.InputColumn{Name: "Help", Data: mHelp},
+				chproto.InputColumn{Name: "Unit", Data: mUnit},
+			}
+			if err := b.exec(ch.Query{Body: metaInput.Into("@@table_metrics_metadata@@"), Input: metaInput}); err != nil {
+				klog.Errorln("failed to insert metrics metadata:", err)
+			}
+		}
+	}()
 }
