@@ -89,6 +89,7 @@ type ClickHouseSpaceManager struct {
 type Cache struct {
 	TTL        timeseries.Duration `yaml:"ttl"`
 	GCInterval timeseries.Duration `yaml:"gc_interval"`
+	RedisURL   string              `yaml:"redis_url"`
 }
 
 type Traces struct {

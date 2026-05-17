@@ -145,6 +145,11 @@ func (c *Cache) projectUpdateIteration(project *db.Project, step timeseries.Dura
 		c.byProject[project.Id].step = step
 		c.lock.Unlock()
 	}
+	if c.redis != nil {
+		if err := c.redis.setStep(project.Id, step); err != nil {
+			klog.Errorln("failed to store step in redis:", err)
+		}
+	}
 	wg := sync.WaitGroup{}
 	tasks := make(chan UpdateTask)
 	to := now.Add(-step)
@@ -184,16 +189,23 @@ func (c *Cache) updaterWorker(projects *sync.Map, projectId db.ProjectId, step t
 		projData = newProjectData()
 		projData.step = step
 		c.byProject[projectId] = projData
-		projectDir := path.Join(c.cfg.Path, string(projectId))
-		if err := utils.CreateDirectoryIfNotExists(projectDir); err != nil {
-			c.lock.Unlock()
-			klog.Errorln(err)
-			return
+		if c.redis == nil {
+			projectDir := path.Join(c.cfg.Path, string(projectId))
+			if err := utils.CreateDirectoryIfNotExists(projectDir); err != nil {
+				c.lock.Unlock()
+				klog.Errorln(err)
+				return
+			}
 		}
 	}
 	c.lock.Unlock()
 
 	for {
+		if c.redis != nil && !c.db.GetPrimaryLock(context.TODO()) {
+			klog.Infoln("not the primary replica: skipping cache update")
+			time.Sleep(MinRefreshInterval.ToStandard())
+			continue
+		}
 		start := time.Now()
 		p, ok := projects.Load(projectId)
 		if !ok {
@@ -253,6 +265,9 @@ func (c *Cache) download(to timeseries.Time, promClient prom.Client, projectId d
 func (c *Cache) writeChunk(projectId db.ProjectId, queryHash string, from timeseries.Time, pointsCount int, step timeseries.Duration, finalized bool, metrics []*model.MetricValues) error {
 	if len(metrics) == 0 {
 		return nil
+	}
+	if c.redis != nil {
+		return c.redis.writeChunk(projectId, queryHash, from, pointsCount, step, finalized, metrics)
 	}
 	c.lock.Lock()
 	projData := c.byProject[projectId]

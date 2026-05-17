@@ -27,6 +27,7 @@ type Cache struct {
 	globalPrometheus *db.IntegrationPrometheus
 	globalClickHouse *db.IntegrationClickhouse
 
+	redis   *redisStore
 	updates chan db.ProjectId
 
 	pendingCompactions prometheus.Gauge
@@ -34,24 +35,24 @@ type Cache struct {
 }
 
 func NewCache(cfg Config, database *db.DB, globalPrometheus *db.IntegrationPrometheus, globalClickHouse *db.IntegrationClickhouse) (*Cache, error) {
-	err := utils.CreateDirectoryIfNotExists(cfg.Path)
-	if err != nil {
-		return nil, err
-	}
-	state, err := db.NewSqlite(cfg.Path)
-	if err != nil {
-		return nil, err
-	}
-	err = state.Migrator().Migrate(&PrometheusQueryState{})
-	if err != nil {
-		return nil, err
+	var redisCl *redisStore
+	if cfg.RedisURL != "" {
+		client, err := newRedisClient(cfg.RedisURL)
+		if err != nil {
+			return nil, err
+		}
+		ttl := cfg.GC.TTL.ToStandard()
+		if ttl <= 0 {
+			ttl = 30 * 24 * time.Hour
+		}
+		redisCl = &redisStore{client: client, ttl: ttl}
 	}
 
 	cache := &Cache{
 		cfg:       cfg,
 		byProject: map[db.ProjectId]*projectData{},
 		db:        database,
-		state:     state.DB(),
+		redis:     redisCl,
 
 		globalPrometheus: globalPrometheus,
 		globalClickHouse: globalClickHouse,
@@ -70,16 +71,31 @@ func NewCache(cfg Config, database *db.DB, globalPrometheus *db.IntegrationProme
 			[]string{"src", "dst"},
 		),
 	}
-	if err := cache.initCacheIndexFromDir(); err != nil {
-		return nil, err
+	if cfg.RedisURL == "" {
+		if err := utils.CreateDirectoryIfNotExists(cfg.Path); err != nil {
+			return nil, err
+		}
+		state, err := db.NewSqlite(cfg.Path)
+		if err != nil {
+			return nil, err
+		}
+		if err = state.Migrator().Migrate(&PrometheusQueryState{}); err != nil {
+			return nil, err
+		}
+		cache.state = state.DB()
+		if err := cache.initCacheIndexFromDir(); err != nil {
+			return nil, err
+		}
 	}
 
 	prometheus.MustRegister(cache.pendingCompactions)
 	prometheus.MustRegister(cache.compactedChunks)
 
 	go cache.updater()
-	go cache.gc()
-	go cache.compaction()
+	if cfg.RedisURL == "" {
+		go cache.gc()
+		go cache.compaction()
+	}
 	return cache, nil
 }
 

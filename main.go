@@ -96,7 +96,8 @@ func main() {
 	globalPrometheus := cfg.GetGlobalPrometheus()
 
 	cacheConfig := cache.Config{
-		Path: path.Join(cfg.DataDir, "cache"),
+		Path:     path.Join(cfg.DataDir, "cache"),
+		RedisURL: cfg.Cache.RedisURL,
 		GC: &cache.GcConfig{
 			TTL:      cfg.Cache.TTL,
 			Interval: cfg.Cache.GCInterval,

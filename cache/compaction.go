@@ -66,6 +66,9 @@ func calcCompactionTasks(compactor Compactor, projectID db.ProjectId, queryHash 
 }
 
 func (c *Cache) compaction() {
+	if c.redis != nil {
+		return
+	}
 	cfg := DefaultCompactionConfig
 	if c.cfg.Compaction != nil {
 		cfg = *c.cfg.Compaction

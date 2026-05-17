@@ -37,6 +37,9 @@ type Status struct {
 }
 
 func (c *Cache) saveState(state *PrometheusQueryState) error {
+	if c.redis != nil {
+		return c.redis.saveState(state.ProjectId, state)
+	}
 	c.stateLock.Lock()
 	defer c.stateLock.Unlock()
 	res, err := c.state.Exec(
@@ -55,6 +58,9 @@ func (c *Cache) saveState(state *PrometheusQueryState) error {
 }
 
 func (c *Cache) loadStates(projectId db.ProjectId) (map[string]*PrometheusQueryState, error) {
+	if c.redis != nil {
+		return c.redis.loadStates(projectId)
+	}
 	res := map[string]*PrometheusQueryState{}
 	rows, err := c.state.Query("SELECT project_id, query, last_ts, last_error FROM prometheus_query_state WHERE project_id = $1", projectId)
 	if err != nil {
@@ -72,6 +78,9 @@ func (c *Cache) loadStates(projectId db.ProjectId) (map[string]*PrometheusQueryS
 }
 
 func (c *Cache) deleteState(state *PrometheusQueryState) error {
+	if c.redis != nil {
+		return c.redis.deleteState(state.ProjectId, state.Query)
+	}
 	c.stateLock.Lock()
 	defer c.stateLock.Unlock()
 	_, err := c.state.Exec("DELETE FROM prometheus_query_state WHERE project_id = $1 AND query = $2", state.ProjectId, state.Query)
@@ -79,6 +88,19 @@ func (c *Cache) deleteState(state *PrometheusQueryState) error {
 }
 
 func (c *Cache) deleteProject(projectId db.ProjectId) error {
+	if c.redis != nil {
+		// load all states and delete them one by one
+		states, err := c.redis.loadStates(projectId)
+		if err != nil {
+			return err
+		}
+		for _, st := range states {
+			if err := c.redis.deleteState(projectId, st.Query); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	c.stateLock.Lock()
 	defer c.stateLock.Unlock()
 	projectDir := path.Join(c.cfg.Path, string(projectId))
@@ -92,6 +114,9 @@ func (c *Cache) deleteProject(projectId db.ProjectId) error {
 }
 
 func (c *Cache) getMinUpdateTime(projectId db.ProjectId) (timeseries.Time, error) {
+	if c.redis != nil {
+		return c.redis.getMinUpdateTime(projectId)
+	}
 	var min sql.NullInt64
 	err := c.state.QueryRow("SELECT min(last_ts) FROM prometheus_query_state WHERE project_id = $1", projectId).Scan(&min)
 	if err != nil {
@@ -101,6 +126,9 @@ func (c *Cache) getMinUpdateTime(projectId db.ProjectId) (timeseries.Time, error
 }
 
 func (c *Cache) getMinUpdateTimeWithoutRecordingRules(projectId db.ProjectId) (timeseries.Time, error) {
+	if c.redis != nil {
+		return c.redis.getMinUpdateTimeWithoutRecordingRules(projectId)
+	}
 	var min sql.NullInt64
 	err := c.state.QueryRow("SELECT min(last_ts) FROM prometheus_query_state WHERE project_id = $1 AND query NOT LIKE 'rr_%'", projectId).Scan(&min)
 	if err != nil {
@@ -110,6 +138,9 @@ func (c *Cache) getMinUpdateTimeWithoutRecordingRules(projectId db.ProjectId) (t
 }
 
 func (c *Cache) getStatus(projectId db.ProjectId) (*Status, error) {
+	if c.redis != nil {
+		return c.redis.getStatus(projectId)
+	}
 	var s Status
 	err := c.state.QueryRow("SELECT last_error FROM prometheus_query_state WHERE project_id = $1 AND last_error != '' LIMIT 1", projectId).Scan(&s.Error)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {

@@ -58,6 +58,22 @@ type header struct {
 	DataSizeOrMetricsCount uint32
 }
 
+func ReadFrom(r io.Reader, from timeseries.Time, pointsCount int, step timeseries.Duration, dest map[uint64]*model.MetricValues, fillFunc timeseries.FillFunc) error {
+	reader := bufio.NewReader(r)
+	h := header{}
+	if err := binary.Read(reader, binary.LittleEndian, &h); err != nil {
+		return err
+	}
+	switch h.Version {
+	case V3:
+		return readV3(reader, &h, from, pointsCount, step, dest, fillFunc)
+	case V4:
+		return readV4(reader, &h, from, pointsCount, step, dest, fillFunc)
+	default:
+		return fmt.Errorf("unknown version: %d", h.Version)
+	}
+}
+
 func ReadMeta(path string) (*Meta, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -89,20 +105,7 @@ func Read(path string, from timeseries.Time, pointsCount int, step timeseries.Du
 		return err
 	}
 	defer f.Close()
-
-	reader := bufio.NewReader(f)
-	h := header{}
-	if err = binary.Read(reader, binary.LittleEndian, &h); err != nil {
-		return err
-	}
-	switch h.Version {
-	case V3:
-		return readV3(reader, &h, from, pointsCount, step, dest, fillFunc)
-	case V4:
-		return readV4(reader, &h, from, pointsCount, step, dest, fillFunc)
-	default:
-		return fmt.Errorf("unknown version: %d", h.Version)
-	}
+	return ReadFrom(f, from, pointsCount, step, dest, fillFunc)
 }
 
 func readV3(reader io.Reader, header *header, from timeseries.Time, pointsCount int, step timeseries.Duration, dest map[uint64]*model.MetricValues, fillFunc timeseries.FillFunc) error {

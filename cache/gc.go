@@ -10,7 +10,7 @@ import (
 )
 
 func (c *Cache) gc() {
-	if c.cfg.GC == nil {
+	if c.cfg.GC == nil || c.redis != nil {
 		return
 	}
 	for range time.Tick(c.cfg.GC.Interval.ToStandard()) {
