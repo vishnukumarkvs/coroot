@@ -258,11 +258,11 @@ func AddExtraSelector(query string, extraSelector string) (string, error) {
 	if extraSelector == "" {
 		return query, nil
 	}
-	extra, err := parser.ParseMetricSelector(extraSelector)
+	extra, err := parser.NewParser(parser.Options{}).ParseMetricSelector(extraSelector)
 	if err != nil {
 		return "", err
 	}
-	expr, err := parser.ParseExpr(query)
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(query)
 	if err != nil {
 		return "", err
 	}

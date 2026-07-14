@@ -6,4 +6,4 @@
 /config.yaml
 /coroot
 /.claude/
-/build.sh
+/build.sh.DS_Store

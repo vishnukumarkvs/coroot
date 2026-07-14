@@ -91,7 +91,7 @@ func (f *CheckConfigForm) Valid() bool {
 }
 
 func validateCustomQuery(query string) error {
-	if _, err := parser.ParseExpr(strings.ReplaceAll(query, "$RANGE", "1m")); err != nil {
+	if _, err := parser.NewParser(parser.Options{}).ParseExpr(strings.ReplaceAll(query, "$RANGE", "1m")); err != nil {
 		return fmt.Errorf("invalid query: %s", err)
 	}
 	return nil

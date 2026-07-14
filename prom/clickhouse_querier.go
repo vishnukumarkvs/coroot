@@ -54,12 +54,12 @@ func (q *clickhouseQuerier) Select(ctx context.Context, _ bool, hints *storage.S
 		OnResult: func(ctx context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
 				lsMap := metricLabels.Row(i)
-				ls := make(labels.Labels, 0, len(lsMap)+1)
-				ls = append(ls, labels.Label{Name: promModel.MetricNameLabel, Value: metricName.Row(i)})
-				for k, v := range lsMap {
-					ls = append(ls, labels.Label{Name: k, Value: v})
-				}
-				sort.Slice(ls, func(i, j int) bool { return ls[i].Name < ls[j].Name })
+			 lbls := make([]labels.Label, 0, len(lsMap)+1)
+			 lbls = append(lbls, labels.Label{Name: promModel.MetricNameLabel, Value: metricName.Row(i)})
+			 for k, v := range lsMap {
+				 lbls = append(lbls, labels.Label{Name: k, Value: v})
+			 }
+			 ls := labels.New(lbls...)
 				tss := timestamps.Row(i)
 				vals := values.Row(i)
 				samples := make([]chunks.Sample, 0, len(tss))
@@ -198,6 +198,10 @@ type sample struct {
 }
 
 func (s sample) T() int64 {
+	return s.t
+}
+
+func (s sample) ST() int64 {
 	return s.t
 }
 
