@@ -47,6 +47,9 @@ func (c *Client) GetServicesFromTraces(ctx context.Context, from timeseries.Time
 }
 
 func (c *Client) GetRootSpansHistogram(ctx context.Context, q SpanQuery) ([]model.HistogramBucket, error) {
+	if q.canUseHistogramMV() {
+		return c.getSpansHistogramMV(ctx, q, true)
+	}
 	filter, filterArgs := q.RootSpansFilter()
 	return c.getSpansHistogram(ctx, q, filter, filterArgs)
 }
@@ -66,6 +69,9 @@ func (c *Client) GetTraceErrors(ctx context.Context, q SpanQuery) (map[model.Tra
 }
 
 func (c *Client) GetSpansByServiceNameHistogram(ctx context.Context, q SpanQuery) ([]model.HistogramBucket, error) {
+	if q.canUseHistogramMV() {
+		return c.getSpansHistogramMV(ctx, q, false)
+	}
 	filter, filterArgs := q.SpansByServiceNameFilter()
 	return c.getSpansHistogram(ctx, q, filter, filterArgs)
 }
@@ -207,6 +213,99 @@ func (c *Client) getTrace(ctx context.Context, sq SpanQuery) (*model.Trace, erro
 		return nil, err
 	}
 	return &model.Trace{Spans: spans}, nil
+}
+
+func (c *Client) getSpansHistogramMV(ctx context.Context, q SpanQuery, rootSpansOnly bool) ([]model.HistogramBucket, error) {
+	step := q.Ctx.Step
+	from := q.Ctx.From
+	to := q.Ctx.To.Add(step)
+
+	var filters []string
+	var filterArgs []any
+
+	qFilters, qArgs := q.Filter()
+	filters = append(filters, qFilters...)
+	filterArgs = append(filterArgs, qArgs...)
+
+	if len(q.ExcludePeerAddrs) > 0 {
+		filters = append(filters, "NetSockPeerAddr NOT IN (@addrs)")
+		filterArgs = append(filterArgs, clickhouse.Named("addrs", q.ExcludePeerAddrs))
+	}
+
+	if rootSpansOnly {
+		filters = append(filters, "IsRootSpan = 1")
+		filters = append(filters, "NOT startsWith(ServiceName, '/')")
+	}
+
+	filters = append(filters, "Timestamp BETWEEN @from AND @to")
+	filterArgs = append(filterArgs,
+		clickhouse.Named("step", int(step)),
+		clickhouse.DateNamed("from", from.ToStandard(), clickhouse.NanoSeconds),
+		clickhouse.DateNamed("to", to.ToStandard(), clickhouse.NanoSeconds),
+	)
+
+	query := "SELECT toStartOfInterval(Timestamp, INTERVAL @step second), DurationBucket, sum(TotalCount), sum(ErrorCount)"
+	query += " FROM @@table_otel_traces_histogram@@"
+	if len(filters) > 0 {
+		query += " WHERE " + strings.Join(filters, " AND ")
+	}
+	query += " GROUP BY 1, 2"
+
+	rows, err := c.Query(ctx, query, filterArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var t time.Time
+	var bucket float64
+	var total, failed uint64
+	byBucket := map[float64]*timeseries.TimeSeries{}
+	errors := map[timeseries.Time]uint64{}
+	for rows.Next() {
+		if err = rows.Scan(&t, &bucket, &total, &failed); err != nil {
+			return nil, err
+		}
+		if byBucket[bucket] == nil {
+			byBucket[bucket] = timeseries.New(from, int(to.Sub(from)/step), step)
+		}
+		ts := timeseries.Time(t.Unix())
+		byBucket[bucket].Set(ts, float32(total)/float32(step))
+		errors[ts] += failed
+	}
+
+	if len(byBucket) == 0 {
+		return nil, nil
+	}
+
+	res := []model.HistogramBucket{
+		{TimeSeries: timeseries.New(from, int(to.Sub(from)/step), step)}, // errors
+	}
+	for ts, count := range errors {
+		res[0].TimeSeries.Set(ts, float32(count)/float32(step))
+	}
+	for i := 1; i < len(HistogramBuckets); i++ {
+		ts := byBucket[HistogramBuckets[i-1]]
+		if ts.IsEmpty() {
+			ts = timeseries.New(from, int(to.Sub(from)/step), step)
+		}
+		if len(res) > 0 {
+			ts = timeseries.Aggregate2(res[len(res)-1].TimeSeries, ts, func(x, y float32) float32 {
+				if timeseries.IsNaN(x) {
+					return y
+				}
+				if timeseries.IsNaN(y) {
+					return x
+				}
+				return x + y
+			})
+		}
+		res = append(res, model.HistogramBucket{
+			Le:         float32(HistogramBuckets[i] / 1000),
+			TimeSeries: ts,
+		})
+	}
+	return res, nil
 }
 
 func (c *Client) getSpansHistogram(ctx context.Context, q SpanQuery, filters []string, filterArgs []any) ([]model.HistogramBucket, error) {
@@ -578,6 +677,15 @@ func (q *SpanQuery) AddFilter(field, op, value string) {
 
 func (q *SpanQuery) IsSelectionDefined() bool {
 	return q.TsFrom > q.Ctx.From || q.TsTo < q.Ctx.To || q.DurFrom > 0 || q.DurTo > 0 || q.Errors
+}
+
+func (q *SpanQuery) canUseHistogramMV() bool {
+	for _, f := range q.Filters {
+		if f.Field != "ServiceName" && f.Field != "SpanName" {
+			return false
+		}
+	}
+	return true
 }
 
 func (q *SpanQuery) DurationFilter() (string, []any) {

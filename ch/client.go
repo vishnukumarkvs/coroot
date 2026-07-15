@@ -393,6 +393,38 @@ CREATE TABLE IF NOT EXISTS metrics_metadata @on_cluster (
 ) ENGINE @replacing_merge_tree
 ORDER BY MetricFamilyName
 SETTINGS index_granularity = 8192`,
+
+		`
+CREATE TABLE IF NOT EXISTS otel_traces_histogram @on_cluster (
+    Timestamp DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+    ServiceName LowCardinality(String) CODEC(ZSTD(1)),
+    SpanName LowCardinality(String) CODEC(ZSTD(1)),
+    NetSockPeerAddr LowCardinality(String) CODEC(ZSTD(1)),
+    IsRootSpan UInt8 CODEC(ZSTD(1)),
+    DurationBucket Float64 CODEC(ZSTD(1)),
+    TotalCount SimpleAggregateFunction(sum, UInt64) CODEC(ZSTD(1)),
+    ErrorCount SimpleAggregateFunction(sum, UInt64) CODEC(ZSTD(1))
+) ENGINE = @merge_tree
+PARTITION BY toDate(Timestamp)
+ORDER BY (ServiceName, SpanName, IsRootSpan, Timestamp, DurationBucket)
+TTL toDateTime(Timestamp) + toIntervalSecond(@ttl_traces)
+SETTINGS index_granularity = 8192`,
+
+		`
+CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces_histogram_mv @on_cluster
+TO otel_traces_histogram AS
+SELECT
+    toStartOfInterval(Timestamp, INTERVAL 1 minute) AS Timestamp,
+    ServiceName,
+    SpanName,
+    NetSockPeerAddr,
+    (ParentSpanId = '') AS IsRootSpan,
+    roundDown(Duration/1000000, [0, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]) AS DurationBucket,
+    count() AS TotalCount,
+    countIf(StatusCode = 'STATUS_CODE_ERROR') AS ErrorCount
+FROM otel_traces
+WHERE (SpanKind = 'SPAN_KIND_SERVER' OR SpanKind = 'SPAN_KIND_CONSUMER') OR ParentSpanId = ''
+GROUP BY Timestamp, ServiceName, SpanName, NetSockPeerAddr, IsRootSpan, DurationBucket`,
 	}
 
 	distributedTables = []string{
@@ -425,13 +457,16 @@ SETTINGS index_granularity = 8192`,
 
 		`CREATE TABLE IF NOT EXISTS metrics_metadata_distributed ON CLUSTER @cluster AS metrics_metadata
 		ENGINE = Distributed(@cluster, currentDatabase(), metrics_metadata, sipHash64(MetricFamilyName))`,
+
+		`CREATE TABLE IF NOT EXISTS otel_traces_histogram_distributed ON CLUSTER @cluster AS otel_traces_histogram
+		ENGINE = Distributed(@cluster, currentDatabase(), otel_traces_histogram, rand())`,
 	}
 )
 
 func ReplaceTables(query string, distributed bool) string {
 	tbls := []string{
 		"otel_logs", "otel_logs_service_name_severity_text",
-		"otel_traces", "otel_traces_trace_id_ts", "otel_traces_service_name",
+		"otel_traces", "otel_traces_trace_id_ts", "otel_traces_service_name", "otel_traces_histogram",
 		"profiling_stacks", "profiling_samples", "profiling_profiles",
 		"metrics", "metrics_metadata",
 	}
