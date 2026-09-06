@@ -1,17 +1,21 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/lib/pq"
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -51,15 +55,33 @@ func NewSqlite(dataDir string) (*DB, error) {
 	return &DB{typ: TypeSqlite, db: db}, nil
 }
 
-func NewPostgres(dsn string) (*DB, error) {
+func NewPostgres(dsn string, useIAM bool) (*DB, error) {
 	var err error
 	if dsn, err = addPostgresConnectTimeout(dsn); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		return nil, err
+	if !useIAM {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			return nil, err
+		}
+		return &DB{typ: TypePostgres, db: db}, nil
 	}
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse DSN: %w", err)
+	}
+	db := stdlib.OpenDB(*cfg, stdlib.OptionBeforeConnect(func(ctx context.Context, c *pgx.ConnConfig) error {
+		region := extractRegionFromHost(c.Host)
+		token, err := buildIAMAuthToken(ctx, c.Host, fmt.Sprintf("%d", c.Port), c.User, region)
+		if err != nil {
+			return err
+		}
+		c.Password = token
+		return nil
+	}))
+	db.SetConnMaxLifetime(10 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	return &DB{typ: TypePostgres, db: db}, nil
 }
 
@@ -75,12 +97,11 @@ func addPostgresConnectTimeout(dsn string) (string, error) {
 		}
 		u.RawQuery = q.Encode()
 		return u.String(), nil
-	} else {
-		if !strings.Contains(dsn, "connect_timeout=") {
-			dsn += " connect_timeout=" + defaultPostgresTimeoutSecond
-		}
-		return dsn, nil
 	}
+	if !strings.Contains(dsn, "connect_timeout=") {
+		dsn += " connect_timeout=" + defaultPostgresTimeoutSecond
+	}
+	return dsn, nil
 }
 
 func (db *DB) Type() Type {
@@ -128,8 +149,11 @@ func (db *DB) Migrate(extraTables ...Table) error {
 func (db *DB) IsUniqueViolationError(err error) bool {
 	switch db.typ {
 	case TypePostgres:
-		e, ok := err.(*pq.Error)
-		return ok && e.Code.Name() == "unique_violation"
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			return pgErr.Code == "23505"
+		}
+		return false
 	case TypeSqlite:
 		e, ok := err.(sqlite3.Error)
 		return ok && e.Code == sqlite3.ErrConstraint
@@ -246,4 +270,29 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func ValidatePostgresIAM(dsn string) error {
+	// use pgx.ParseConfig to extract host
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("invalid DSN: %w", err)
+	}
+	if cfg.Host == "" {
+		return fmt.Errorf("IAM auth: host is required")
+	}
+	if extractRegionFromHost(cfg.Host) == "" && os.Getenv("AWS_REGION") == "" && os.Getenv("AWS_DEFAULT_REGION") == "" {
+		return fmt.Errorf("IAM auth: cannot determine AWS region from host %q and AWS_REGION not set; use standard RDS endpoint like db.x.region.rds.amazonaws.com or set AWS_REGION", cfg.Host)
+	}
+	return nil
+}
+
+func extractRegionFromHost(host string) string {
+	parts := strings.Split(host, ".")
+	for i, p := range parts {
+		if p == "rds" && i > 0 {
+			return parts[i-1]
+		}
+	}
+	return ""
 }

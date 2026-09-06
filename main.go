@@ -56,8 +56,12 @@ func main() {
 
 	var database *db.DB
 	if cfg.Postgres != nil && cfg.Postgres.ConnectionString != "" {
-		klog.Infoln("database type: postgres")
-		database, err = db.NewPostgres(cfg.Postgres.ConnectionString)
+		if cfg.Postgres.IamAuth {
+			klog.Infoln("database type: postgres (IAM auth)")
+		} else {
+			klog.Infoln("database type: postgres")
+		}
+		database, err = db.NewPostgres(cfg.Postgres.ConnectionString, cfg.Postgres.IamAuth)
 	} else {
 		klog.Infoln("database type: sqlite")
 		database, err = db.NewSqlite(cfg.DataDir)

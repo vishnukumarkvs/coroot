@@ -24,6 +24,7 @@ var (
 	profilesTTL                                 = timeseries.DurationFlag(kingpin.Flag("profiles-ttl", "Profiles TTL (e.g. 8h, 3d, 2w; default 7d)").Envar("PROFILES_TTL"))
 	metricsTTL                                  = timeseries.DurationFlag(kingpin.Flag("metrics-ttl", "Metrics TTL (e.g. 8h, 30d, 1y; default 7d)").Envar("METRICS_TTL"))
 	pgConnectionString                          = kingpin.Flag("pg-connection-string", "Postgres connection string (sqlite is used if not set)").Envar("PG_CONNECTION_STRING").String()
+	pgIamAuth                                   = kingpin.Flag("pg-iam-auth", "Use IAM authentication for Postgres (RDS/Aurora). When enabled, password is generated via AWS SDK using IRSA).").Envar("PG_IAM_AUTH").Bool()
 	doNotCheckForDeployments                    = kingpin.Flag("do-not-check-for-deployments", "Don't check for new deployments").Envar("DO_NOT_CHECK_FOR_DEPLOYMENTS").Bool()
 	doNotCheckForUpdates                        = kingpin.Flag("do-not-check-for-updates", "Don't check for new versions").Envar("DO_NOT_CHECK_FOR_UPDATES").Bool()
 	disableUsageStatistics                      = kingpin.Flag("disable-usage-statistics", "Disable usage statistics").Envar("DISABLE_USAGE_STATISTICS").Bool()
@@ -111,6 +112,9 @@ func (cfg *Config) ApplyFlags() {
 	}
 	if *pgConnectionString != "" {
 		cfg.Postgres = &Postgres{ConnectionString: *pgConnectionString}
+	}
+	if cfg.Postgres != nil && *pgIamAuth {
+		cfg.Postgres.IamAuth = true
 	}
 	if *doNotCheckForDeployments {
 		cfg.DoNotCheckForDeployments = *doNotCheckForDeployments

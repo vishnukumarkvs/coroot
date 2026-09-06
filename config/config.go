@@ -109,6 +109,7 @@ type Metrics struct {
 
 type Postgres struct {
 	ConnectionString string `yaml:"connection_string"`
+	IamAuth          bool   `yaml:"iam_auth"`
 }
 
 type Clickhouse struct {
@@ -325,6 +326,12 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.ClickHouseSpaceManager.UsageThresholdPercent < 0 || cfg.ClickHouseSpaceManager.UsageThresholdPercent > 100 {
 		return fmt.Errorf("invalid usage_threshold_percent: %d", cfg.ClickHouseSpaceManager.UsageThresholdPercent)
+	}
+
+	if cfg.Postgres != nil && cfg.Postgres.IamAuth {
+		if err := db.ValidatePostgresIAM(cfg.Postgres.ConnectionString); err != nil {
+			return fmt.Errorf("invalid postgres iam auth: %w", err)
+		}
 	}
 
 	return nil
