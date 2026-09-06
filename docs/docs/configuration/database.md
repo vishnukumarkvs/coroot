@@ -43,6 +43,22 @@ env:
   
 To learn more about the connection string format follow the [Postgres documentation](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING).
 
+### AWS RDS/Aurora IAM Authentication
+
+If you are running Coroot in AWS and want to connect to an RDS or Aurora Postgres database using IAM authentication, you can enable it by setting the `--pg-iam-auth` command-line argument or the `PG_IAM_AUTH=true` environment variable.
+
+When enabled, Coroot will automatically generate an IAM authentication token to use as the password every time a new connection is established, and will safely recycle connections before the 15-minute token expires.
+
+Ensure that the environment running Coroot has the appropriate IAM permissions to connect to the database (e.g. via IRSA for EKS, or IAM instance profile for EC2). Your connection string should point to the RDS endpoint and specify `sslmode=require`. You do not need to provide a password.
+
+```bash
+docker run -d --name coroot \
+  -p 8080:8080 \
+  -e PG_CONNECTION_STRING="host=db.cluster-xxx.us-east-1.rds.amazonaws.com user=coroot dbname=coroot sslmode=require" \
+  -e PG_IAM_AUTH="true" \
+  ghcr.io/coroot/coroot
+```
+
 ### Connection Poolers
 
 Coroot is incompatible with PostgreSQL connection poolers like pgbouncer when they're configured to run in transactional mode. This is because Coroot relies on connection-level prepared statements, which don't persist across transactions in pooled connections. If you need to use a connection pooler, configure it to operate in session mode to ensure prepared statements remain available throughout the connection lifecycle.
