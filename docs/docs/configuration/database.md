@@ -49,7 +49,37 @@ If you are running Coroot in AWS and want to connect to an RDS or Aurora Postgre
 
 When enabled, Coroot will automatically generate an IAM authentication token to use as the password every time a new connection is established, and will safely recycle connections before the 15-minute token expires.
 
-Ensure that the environment running Coroot has the appropriate IAM permissions to connect to the database (e.g. via IRSA for EKS, or IAM instance profile for EC2). Your connection string should point to the RDS endpoint and specify `sslmode=require`. You do not need to provide a password.
+To use IAM Authentication, you must configure both your database and your AWS IAM policies:
+
+**1. Database Role Configuration**
+The Postgres user must be granted the `rds_iam` role. Connect to your database as an administrator and run:
+
+```sql
+CREATE USER coroot WITH LOGIN;
+GRANT rds_iam TO coroot;
+CREATE DATABASE coroot WITH OWNER = coroot;
+```
+
+**2. IAM Permissions**
+The environment running Coroot (e.g., your EKS pod via IRSA, or EC2 instance profile) must have an IAM policy granting the `rds-db:connect` permission:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["rds-db:connect"],
+      "Resource": [
+        "arn:aws:rds-db:<region>:<account-id>:dbuser:<db-cluster-resource-id>/coroot"
+      ]
+    }
+  ]
+}
+```
+
+**3. Coroot Configuration**
+Your connection string should point to the RDS endpoint and specify `sslmode=require`. You do not need to provide a password in the connection string.
 
 ```bash
 docker run -d --name coroot \
