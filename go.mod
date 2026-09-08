@@ -1,6 +1,6 @@
 module github.com/coroot/coroot
 
-go 1.25.5
+go 1.26.0
 
 require (
 	github.com/ClickHouse/ch-go v0.73.0
@@ -37,7 +37,7 @@ require (
 	github.com/xhit/go-str2duration/v2 v2.1.0
 	go.opentelemetry.io/collector/semconv v0.110.0
 	go.opentelemetry.io/proto/otlp v1.9.0
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa
 	golang.org/x/net v0.57.0
 	golang.org/x/term v0.45.0
